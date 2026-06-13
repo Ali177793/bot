@@ -1,5 +1,5 @@
 import os
-import psycopg2
+import psycopg
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -13,30 +13,21 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 
 def get_db():
-    result = urlparse(os.getenv("DATABASE_URL"))
-    return psycopg2.connect(
-        database=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port
-    )
+    return psycopg.connect(os.getenv("DATABASE_URL"))
 
 def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS prayers
-                 (id SERIAL PRIMARY KEY,
-                  user_id BIGINT,
-                  text TEXT,
-                  message_id BIGINT,
-                  ameen_count INTEGER DEFAULT 0,
-                  created_at TEXT,
-                  is_pinned INTEGER DEFAULT 0,
-                  username TEXT,
-                  first_name TEXT)''')
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute('''CREATE TABLE IF NOT EXISTS prayers
+                         (id SERIAL PRIMARY KEY,
+                          user_id BIGINT,
+                          text TEXT,
+                          message_id BIGINT,
+                          ameen_count INTEGER DEFAULT 0,
+                          created_at TEXT,
+                          is_pinned INTEGER DEFAULT 0,
+                          username TEXT,
+                          first_name TEXT)''')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("أهلاً بك في بوت الأدعية 🤲\nأرسل دعاءك وسيتم نشره في القناة.")
@@ -52,15 +43,11 @@ async def handle_prayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO prayers (user_id, text, message_id, created_at, username, first_name) VALUES (%s, %s, %s, %s, %s, %s)",
-              (user.id, text, sent.message_id, update.message.date.isoformat(), user.username, user.first_name))
-    conn.commit()
-    
-    c.execute("SELECT id FROM prayers WHERE message_id = %s", (sent.message_id,))
-    prayer_id = c.fetchone()[0]
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("INSERT INTO prayers (user_id, text, message_id, created_at, username, first_name) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                      (user.id, text, sent.message_id, update.message.date.isoformat(), user.username, user.first_name))
+            prayer_id = c.fetchone()[0]
     
     keyboard = [[InlineKeyboardButton("آمين 🤲", callback_data=f"ameen_{prayer_id}")]]
     await context.bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=sent.message_id, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -71,12 +58,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     prayer_id = int(query.data.split("_")[1])
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE prayers SET ameen_count = ameen_count + 1 WHERE id = %s RETURNING ameen_count", (prayer_id,))
-    count = c.fetchone()[0]
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE prayers SET ameen_count = ameen_count + 1 WHERE id = %s RETURNING ameen_count", (prayer_id,))
+            count = c.fetchone()[0]
     
     keyboard = [[InlineKeyboardButton(f"آمين 🤲 {count}", callback_data=f"ameen_{prayer_id}")]]
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
