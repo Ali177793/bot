@@ -1,78 +1,120 @@
 import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler, CallbackQueryHandler
 import psycopg
-from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from dotenv import load_dotenv
 
-load_dotenv()
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-BOT_USERNAME = os.getenv("BOT_USERNAME")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_db():
-    return psycopg.connect(os.getenv("DATABASE_URL"))
+# سعر نشر الدعاء بالنجوم
+DUA_PRICE = 1 # نجمة واحدة
 
-def init_db():
-    with get_db() as conn:
-        with conn.cursor() as c:
-            c.execute('''CREATE TABLE IF NOT EXISTS prayers
-                         (id SERIAL PRIMARY KEY,
-                          user_id BIGINT,
-                          text TEXT,
-                          message_id BIGINT,
-                          ameen_count INTEGER DEFAULT 0,
-                          created_at TEXT,
-                          is_pinned INTEGER DEFAULT 0,
-                          username TEXT,
-                          first_name TEXT)''')
+# الاتصال بقاعدة البيانات
+conn = psycopg.connect(DATABASE_URL)
+cur = conn.cursor()
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS duas (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT,
+        text TEXT,
+        message_id BIGINT,
+        amen_count INT DEFAULT 0
+    )
+""")
+conn.commit()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أهلاً بك في بوت الأدعية 🤲\nأرسل دعاءك وسيتم نشره في القناة.")
+    await update.message.reply_text(
+        "اهلاً بيك 🌟\nارسل دعاءك وادفع نجمة واحدة حتى ينشر بالقناة\n\nالدعاء + زر آمين 🤲"
+    )
 
-async def handle_prayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
+async def handle_dua(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_dua = update.message.text
+    user_id = update.message.from_user.id
     
-    keyboard = [[InlineKeyboardButton("آمين 🤲", callback_data=f"ameen_0")]]
-    sent = await context.bot.send_message(
+    # حفظ الدعاء مؤقتاً
+    context.user_data['pending_dua'] = user_dua
+    
+    # انشاء فاتورة الدفع بالنجوم
+    prices = [LabeledPrice("نشر دعاء", DUA_PRICE)]
+    await update.message.reply_invoice(
+        title="نشر دعاء",
+        description=f"دفع {DUA_PRICE} نجمة لنشر دعاءك بالقناة",
+        payload=f"dua_{user_id}",
+        provider_token="", # فارغ للنجوم
+        currency="XTR", # XTR = Telegram Stars
+        prices=prices
+    )
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_dua = context.user_data.get('pending_dua')
+    
+    if not user_dua:
+        await update.message.reply_text("صار خطأ، ارسل الدعاء مرة ثانية")
+        return
+    
+    # نشر الدعاء بالقناة
+    keyboard = [[InlineKeyboardButton("آمين 🤲 0", callback_data="amen_0")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    sent_msg = await context.bot.send_message(
         chat_id=CHANNEL_ID,
-        text=f"دعاء من {user.first_name}:\n\n{text}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        text=f"🤲 {user_dua}",
+        reply_markup=reply_markup
     )
     
-    with get_db() as conn:
-        with conn.cursor() as c:
-            c.execute("INSERT INTO prayers (user_id, text, message_id, created_at, username, first_name) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                      (user.id, text, sent.message_id, update.message.date.isoformat(), user.username, user.first_name))
-            prayer_id = c.fetchone()[0]
+    # حفظ بالداتابيس
+    cur.execute(
+        "INSERT INTO duas (user_id, text, message_id) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, user_dua, sent_msg.message_id)
+    )
+    dua_id = cur.fetchone()[0]
+    conn.commit()
     
-    keyboard = [[InlineKeyboardButton("آمين 🤲", callback_data=f"ameen_{prayer_id}")]]
-    await context.bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=sent.message_id, reply_markup=InlineKeyboardMarkup(keyboard))
+    # تحديث زر آمين بالـ dua_id
+    new_keyboard = [[InlineKeyboardButton("آمين 🤲 0", callback_data=f"amen_{dua_id}")]]
+    await context.bot.edit_message_reply_markup(
+        chat_id=CHANNEL_ID,
+        message_id=sent_msg.message_id,
+        reply_markup=InlineKeyboardMarkup(new_keyboard)
+    )
     
-    await update.message.reply_text("تم نشر دعاءك ✅")
+    await update.message.reply_text("✅ تم نشر دعاءك بالقناة بنجاح")
+    del context.user_data['pending_dua']
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def amen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    prayer_id = int(query.data.split("_")[1])
+    dua_id = int(query.data.split("_")[1])
     
-    with get_db() as conn:
-        with conn.cursor() as c:
-            c.execute("UPDATE prayers SET ameen_count = ameen_count + 1 WHERE id = %s RETURNING ameen_count", (prayer_id,))
-            count = c.fetchone()[0]
+    # زيادة العداد
+    cur.execute("UPDATE duas SET amen_count = amen_count + 1 WHERE id = %s RETURNING amen_count", (dua_id,))
+    new_count = cur.fetchone()[0]
+    conn.commit()
     
-    keyboard = [[InlineKeyboardButton(f"آمين 🤲 {count}", callback_data=f"ameen_{prayer_id}")]]
+    # تحديث الزر
+    keyboard = [[InlineKeyboardButton(f"آمين 🤲 {new_count}", callback_data=f"amen_{dua_id}")]]
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-    await query.answer("آمين يا رب 🤲")
+    await query.answer("آمين يارب 🤲")
 
 def main():
-    init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prayer))
-    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dua))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CallbackQueryHandler(amen_callback, pattern="^amen_"))
+    
     app.run_polling()
 
 if __name__ == "__main__":
